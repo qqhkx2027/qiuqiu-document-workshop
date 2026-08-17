@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import io
 import tempfile
 import uuid
 from datetime import datetime
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image, ImageOps
 from flask import Flask, render_template, request, send_file
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -41,15 +43,59 @@ def _order_points(points: np.ndarray) -> np.ndarray:
     return rect
 
 
-def _candidate_quad(contour: np.ndarray, image_area: float) -> tuple[float, np.ndarray] | None:
+def _candidate_quad(
+    contour: np.ndarray,
+    image_area: float,
+    image_width: int,
+    image_height: int,
+) -> tuple[float, np.ndarray] | None:
     perimeter = cv2.arcLength(contour, True)
-    approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+    # Rounded ID-card corners often need a little more simplification than a
+    # sharp paper rectangle. Try a slightly wider tolerance before giving up.
+    approx = cv2.approxPolyDP(contour, 0.025 * perimeter, True)
     if len(approx) != 4 or not cv2.isContourConvex(approx):
         return None
     area = abs(cv2.contourArea(approx))
-    if area < image_area * 0.08:
+    if area < image_area * 0.08 or area > image_area * 0.92:
         return None
-    return area, approx.reshape(4, 2).astype("float32")
+    points = approx.reshape(4, 2).astype("float32")
+    # A contour coinciding with the photograph boundary is the whole photo,
+    # not the card. Never use that as a crop fallback.
+    margin_x = max(2.0, image_width * 0.008)
+    margin_y = max(2.0, image_height * 0.008)
+    if (
+        np.any(points[:, 0] <= margin_x)
+        or np.any(points[:, 0] >= image_width - margin_x)
+        or np.any(points[:, 1] <= margin_y)
+        or np.any(points[:, 1] >= image_height - margin_y)
+    ):
+        return None
+    return area, points
+
+
+def _score_candidate(area: float, points: np.ndarray, image_area: float, target_ratio: float) -> float:
+    rect = cv2.minAreaRect(points)
+    rw, rh = rect[1]
+    if min(rw, rh) <= 0:
+        return 0.0
+    ratio = max(rw, rh) / min(rw, rh)
+    ratio_penalty = abs(np.log(max(ratio, 1e-6) / target_ratio))
+    return (area / image_area) / (1.0 + ratio_penalty * 1.8)
+
+
+def _find_candidates(mask: np.ndarray, image_area: float, image_width: int, image_height: int) -> list[tuple[float, np.ndarray]]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    target_ratio = CARD_WIDTH_MM / CARD_HEIGHT_MM
+    candidates: list[tuple[float, np.ndarray]] = []
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:100]:
+        candidate = _candidate_quad(contour, image_area, image_width, image_height)
+        if not candidate:
+            continue
+        area, points = candidate
+        score = _score_candidate(area, points, image_area, target_ratio)
+        if score > 0:
+            candidates.append((score, points))
+    return candidates
 
 
 def _detect_card(image: np.ndarray) -> np.ndarray:
@@ -60,37 +106,30 @@ def _detect_card(image: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(gray, 45, 140)
-    edges = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=1)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     image_area = float(working.shape[0] * working.shape[1])
-    target_ratio = CARD_WIDTH_MM / CARD_HEIGHT_MM
+    working_h, working_w = working.shape[:2]
     candidates: list[tuple[float, np.ndarray]] = []
-    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:80]:
-        candidate = _candidate_quad(contour, image_area)
-        if not candidate:
-            continue
-        area, points = candidate
-        rect = cv2.minAreaRect(points)
-        rw, rh = rect[1]
-        if min(rw, rh) <= 0:
-            continue
-        ratio = max(rw, rh) / min(rw, rh)
-        ratio_penalty = abs(np.log(max(ratio, 1e-6) / target_ratio))
-        # Favor large contours while preferring the ID-card aspect ratio.
-        score = (area / image_area) / (1.0 + ratio_penalty * 1.8)
-        candidates.append((score, points))
+    edge_kernel = np.ones((5, 5), np.uint8)
+    edges = cv2.dilate(edges, edge_kernel, iterations=1)
+    candidates.extend(_find_candidates(edges, image_area, working_w, working_h))
+
+    # A white ID card on a dark desk often has no reliable Canny outline:
+    # the security pattern and wood grain produce more edges than the border.
+    # Bright-region masks make the card itself the dominant contour.
+    for threshold in (130, 150, 170, 190):
+        bright = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)[1]
+        bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8), iterations=2)
+        candidates.extend(_find_candidates(bright, image_area, working_w, working_h))
+
+    # Otsu is useful when exposure differs greatly between photos.
+    _, bright = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8), iterations=2)
+    candidates.extend(_find_candidates(bright, image_area, working_w, working_h))
 
     if candidates:
         points = max(candidates, key=lambda item: item[0])[1]
-    elif contours:
-        largest = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(largest) < image_area * 0.05:
-            raise ValueError("没有找到足够大的证件轮廓，请让证件完整出现在画面内。")
-        rect = cv2.boxPoints(cv2.minAreaRect(largest)).astype("float32")
-        points = rect
     else:
-        raise ValueError("没有检测到证件边缘，请重新拍摄。")
+        raise ValueError("没有找到足够大的证件轮廓，请让证件完整出现在画面内。")
 
     if scale < 1:
         points /= scale
@@ -116,8 +155,12 @@ def _read_upload(upload) -> np.ndarray:
     raw = upload.read()
     if not raw or len(raw) > MAX_UPLOAD_BYTES:
         raise ValueError("图片为空或超过 25MB，请重新选择。")
-    image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if image is None:
+    try:
+        # OpenCV ignores EXIF orientation. Phone photos commonly store the
+        # camera rotation in EXIF, so transpose before handing pixels to CV.
+        pil_image = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+        image = cv2.cvtColor(np.asarray(pil_image), cv2.COLOR_RGB2BGR)
+    except (OSError, ValueError):
         raise ValueError("无法读取图片，请使用 JPG、PNG 或 HEIC 转换后的图片。")
     return image
 

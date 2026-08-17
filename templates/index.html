@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>秋秋证件工坊 · qiuqiu-document-workshop</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div class="eyebrow">LOCAL · PRIVATE</div>
+        <h1>秋秋证件工坊</h1>
+        <p>上传或直接拍摄身份证正反面，自动透视矫正并生成一张 A4 PDF。</p>
+      </header>
+
+      <section class="notice">
+        <strong>隐私说明</strong>
+        <span>照片只在本机处理，不上传到云端；原始照片不会写入项目目录。</span>
+      </section>
+
+      {% if error %}
+      <div class="alert error">{{ error }}</div>
+      {% endif %}
+      {% if result %}
+      <div class="alert success">
+        <span>处理完成，已按身份证标准尺寸排版。</span>
+        <a class="download" href="{{ result.url }}">下载 {{ result.name }}</a>
+      </div>
+      {% endif %}
+
+      <form class="card" action="{{ url_for('process') }}" method="post" enctype="multipart/form-data">
+        <div class="steps">
+          <span class="step active">1</span><span>上传两面照片</span>
+          <i></i>
+          <span class="step">2</span><span>自动矫正</span>
+          <i></i>
+          <span class="step">3</span><span>下载 PDF</span>
+        </div>
+
+        <div class="upload-grid">
+          <label class="upload-box" for="front">
+            <span class="upload-label">身份证正面</span>
+            <span class="upload-hint">国徽面 · 建议平行拍摄</span>
+            <img class="preview" id="frontPreview" alt="正面预览" hidden />
+            <span class="upload-action" id="frontAction">选择照片 / 打开相机</span>
+            <input id="front" name="front" type="file" accept="image/*" capture="environment" required />
+          </label>
+          <label class="upload-box" for="back">
+            <span class="upload-label">身份证反面</span>
+            <span class="upload-hint">信息面 · 避免反光和遮挡</span>
+            <img class="preview" id="backPreview" alt="反面预览" hidden />
+            <span class="upload-action" id="backAction">选择照片 / 打开相机</span>
+            <input id="back" name="back" type="file" accept="image/*" capture="environment" required />
+          </label>
+        </div>
+
+        <div class="tip-list">
+          <span>拍摄建议</span>
+          <ul>
+            <li>把证件完整放进画面，四条边尽量清晰。</li>
+            <li>避免强反光、阴影和手指遮挡；背景尽量干净。</li>
+            <li>PDF 为 A4 纵向，正面和反面各占一张标准身份证大小。</li>
+          </ul>
+        </div>
+
+        <button class="submit" type="submit">自动裁剪并生成 PDF</button>
+      </form>
+    </main>
+    <script>
+      function bindPreview(inputId, previewId, actionId) {
+        const input = document.getElementById(inputId);
+        const preview = document.getElementById(previewId);
+        const action = document.getElementById(actionId);
+        input.addEventListener("change", () => {
+          const file = input.files && input.files[0];
+          if (!file) return;
+          preview.src = URL.createObjectURL(file);
+          preview.hidden = false;
+          action.textContent = "重新选择照片";
+        });
+      }
+      bindPreview("front", "frontPreview", "frontAction");
+      bindPreview("back", "backPreview", "backAction");
+    </script>
+  </body>
+</html>
